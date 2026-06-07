@@ -2,10 +2,6 @@
 
 **AI Credential & Secrets Scanner**
 
-<p align="center">
-  <img src="aihound.png" alt="AIAudit" width="500">
-</p>
-
 AIAudit is a fast, read-only Rust binary that finds exposed API keys, OAuth tokens, MCP server secrets, and session credentials across 29 AI tools on Windows, macOS, Linux, and WSL. Run it locally in seconds, or push it to remote Windows machines via SMB and scan an entire fleet without installing anything.
 
 > Credentials are **redacted by default** — output is safe to include in reports and screenshots. Use `--show-secrets` only on your own machine when you need the raw values.
