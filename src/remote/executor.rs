@@ -1,7 +1,5 @@
 //! Parallel remote host scanning via PSExec-style SMB2 + SCM service execution.
-//!
-//! Replaces the WinRM-based executor. Uses only std::net::TcpStream; no external
-//! crates beyond those already in Cargo.toml.
+//! Uses only std::net::TcpStream; no external crates beyond those already in Cargo.toml.
 
 #![cfg(feature = "remote")]
 
@@ -61,25 +59,28 @@ fn scan_one_host(host: &Host, config: &RemoteConfig) -> anyhow::Result<Vec<ScanR
         .unwrap_or_else(std::env::current_exe)?;
     let bytes = std::fs::read(&exe_path)
         .map_err(|e| anyhow::anyhow!("Failed to read {}: {}", exe_path.display(), e))?;
-    session.write_file(admin_tree, r"Temp\aiaudit.exe", &bytes)?;
+
+    let run_id = random_hex(8);
+    let exe_rel  = format!(r"Temp\aih_{}.exe",      run_id);
+    let out_rel  = format!(r"Temp\aih_{}_out.txt",  run_id);
+    let exe_abs  = format!(r"C:\Windows\Temp\aih_{}.exe",      run_id);
+    let out_abs  = format!(r"C:\Windows\Temp\aih_{}_out.txt",  run_id);
+    let svc_name = format!("aih_{}", &run_id[..8]);
+
+    session.write_file(admin_tree, &exe_rel, &bytes)?;
 
     // Run via SCM — output redirected to a temp file
-    let binary_path =
-        r"cmd /c C:\Windows\Temp\aiaudit.exe --json > C:\Windows\Temp\aiaudit_out.txt 2>&1";
-    let svc_name = {
-        let base = host.hostname.as_str();
-        format!("aih_{}", &base[..base.len().min(8)])
-    };
+    let binary_path = format!(r"cmd /c {} --json > {} 2>&1", exe_abs, out_abs);
 
     let mut scm = Scm::open(&session, ipc_tree)?;
-    scm.run_command(&session, &svc_name, binary_path)?;
+    scm.run_command(&session, &svc_name, &binary_path)?;
 
     // Read output
-    let output = session.read_file(admin_tree, r"Temp\aiaudit_out.txt")?;
+    let output = session.read_file(admin_tree, &out_rel)?;
 
     // Best-effort cleanup
-    let _ = session.delete_file(admin_tree, r"Temp\aiaudit.exe");
-    let _ = session.delete_file(admin_tree, r"Temp\aiaudit_out.txt");
+    let _ = session.delete_file(admin_tree, &exe_rel);
+    let _ = session.delete_file(admin_tree, &out_rel);
 
     let json_str = String::from_utf8_lossy(&output);
     let report = extract_json(&json_str)
@@ -137,6 +138,14 @@ fn split_domain_user(user: &str) -> (&str, &str) {
     } else {
         ("", user)
     }
+}
+
+/// Generate `n` random bytes as a lowercase hex string using the OS CSPRNG.
+fn random_hex(n: usize) -> String {
+    use rand::{RngCore, rngs::OsRng};
+    let mut bytes = vec![0u8; n];
+    OsRng.fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
 /// Pull the first complete JSON object out of mixed command output.

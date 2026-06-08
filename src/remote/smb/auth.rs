@@ -179,11 +179,10 @@ pub fn nt_hash(password: &str) -> [u8; 16] {
 }
 
 pub fn client_challenge() -> [u8; 8] {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().subsec_nanos() as u64;
-    let v = secs.wrapping_mul(0x517c_c1b7_2722_0a95).wrapping_add(nanos).wrapping_add(0xa5a5_a5a5_a5a5_a5a5);
-    v.to_le_bytes()
+    use rand::{RngCore, rngs::OsRng};
+    let mut cc = [0u8; 8];
+    OsRng.fill_bytes(&mut cc);
+    cc
 }
 
 pub fn filetime_now() -> u64 {
@@ -241,7 +240,7 @@ pub fn build_type3(
     user: &str,
     domain: &str,
     password: &str,
-) -> Vec<u8> {
+) -> (Vec<u8>, [u8; 16]) {
     const SIG: &[u8; 8] = b"NTLMSSP\0";
     const FLAGS: u32 = 0xa082_8a05;
 
@@ -266,6 +265,9 @@ pub fn build_type3(
     let mut ntprf_in = server_challenge.to_vec();
     ntprf_in.extend_from_slice(&blob);
     let nt_proof = hmac_md5(&response_key_nt, &ntprf_in);
+    // SessionBaseKey = HMAC-MD5(ResponseKeyNT, NTProofStr). Without NTLMSSP_NEGOTIATE_KEY_EXCH,
+    // this IS the ExportedSessionKey used directly as the SMB2 signing key (dialects 2.x).
+    let session_base_key = hmac_md5(&response_key_nt, &nt_proof);
 
     let mut nt_resp = nt_proof.to_vec();
     nt_resp.extend_from_slice(&blob);
@@ -303,7 +305,7 @@ pub fn build_type3(
     msg.extend_from_slice(&nt_resp);
     msg.extend_from_slice(&domain_utf16);
     msg.extend_from_slice(&user_utf16);
-    msg
+    (msg, session_base_key)
 }
 
 fn push_sec_buf(buf: &mut Vec<u8>, len: u16, offset: u32) {

@@ -17,11 +17,6 @@ pub mod executor;
 pub mod scm;
 #[cfg(feature = "remote")]
 pub mod smb;
-/// winrm is kept on disk but requires the separate `winrm_compat` feature
-/// (which also needs `reqwest`) to compile. Not used by the default executor.
-#[cfg(all(feature = "remote", feature = "winrm_compat"))]
-pub mod winrm;
-
 /// Authentication method for remote SMB2 connections.
 #[derive(Debug, Clone, Default)]
 pub enum AuthMethod {

@@ -45,6 +45,9 @@ pub struct SmbSession {
     stream: Mutex<TcpStream>,
     session_id: u64,
     msg_counter: Mutex<u64>,
+    /// HMAC-SHA256 signing key established after NTLM authentication. None during
+    /// negotiate and session-setup; set on every subsequent outgoing message.
+    signing_key: Option<[u8; 16]>,
 }
 
 impl SmbSession {
@@ -60,6 +63,7 @@ impl SmbSession {
             stream: Mutex::new(stream),
             session_id: 0,
             msg_counter: Mutex::new(1),
+            signing_key: None,
         };
 
         session.do_negotiate()?;
@@ -130,11 +134,17 @@ impl SmbSession {
         id
     }
 
-    /// Send a framed SMB2 message. The underlying TcpStream has a 30s write timeout
-    /// configured at connect time, bounding lock hold duration.
+    /// Send a framed SMB2 message. Signs the message with HMAC-SHA256 when the
+    /// session signing key is present (all messages after authentication).
     fn send(&self, payload: &[u8]) -> anyhow::Result<()> {
         let mut s = self.stream.lock().unwrap_or_else(|e| e.into_inner());
-        send_message(&mut *s, payload)
+        match &self.signing_key {
+            Some(key) => {
+                let signed = sign_smb2_message(payload, key);
+                send_message(&mut *s, &signed)
+            }
+            None => send_message(&mut *s, payload),
+        }
     }
 
     /// Receive a framed SMB2 message. The underlying TcpStream has a 30s read timeout
@@ -150,8 +160,8 @@ impl SmbSession {
         self.send(&pkt)?;
         let resp = self.recv()?;
         let (dialect, _blob) = parse_negotiate(&resp)?;
-        // Accept SMB 2.0.2, 2.1, or 3.0
-        if !matches!(dialect, 0x0202 | 0x0210 | 0x0300) {
+        // Accept SMB 2.0.2 or 2.1 (the only dialects we offer; both use HMAC-SHA256 signing).
+        if !matches!(dialect, 0x0202 | 0x0210) {
             anyhow::bail!("SMB2 Negotiate: unsupported dialect 0x{:04X}", dialect);
         }
         Ok(())
@@ -179,7 +189,8 @@ impl SmbSession {
         let (server_challenge, target_info) = auth::parse_type2(&ntlm2)?;
 
         // Round 2: send Type3
-        let type3 = auth::build_type3(&server_challenge, &target_info, user, domain, password);
+        let (type3, session_key) =
+            auth::build_type3(&server_challenge, &target_info, user, domain, password);
         let spnego3 = auth::spnego_wrap_type3(&type3);
         let mid2 = self.next_msg_id();
         let pkt2 = session_setup_request(mid2, session_id1, &spnego3);
@@ -191,6 +202,9 @@ impl SmbSession {
         }
 
         self.session_id = session_id2;
+        // Activate signing: all subsequent messages (TreeConnect, Create, …) will be
+        // signed with HMAC-SHA256 using the NTLM exported session key.
+        self.signing_key = Some(session_key);
         Ok(())
     }
 

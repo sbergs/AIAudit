@@ -108,17 +108,18 @@ pub fn negotiate_request(message_id: u64) -> Vec<u8> {
     let hdr = smb2_header(CMD_NEGOTIATE, message_id, 0, 0, 0);
     let mut body = Vec::new();
     body.extend_from_slice(&36u16.to_le_bytes()); // structure_size
-    body.extend_from_slice(&3u16.to_le_bytes());  // dialect_count
-    body.extend_from_slice(&1u16.to_le_bytes());  // security_mode (signing capable)
+    body.extend_from_slice(&2u16.to_le_bytes());  // dialect_count
+    body.extend_from_slice(&3u16.to_le_bytes());  // security_mode: SIGNING_CAPABLE | SIGNING_REQUIRED
     body.extend_from_slice(&0u16.to_le_bytes());  // reserved
     body.extend_from_slice(&0x7fu32.to_le_bytes()); // capabilities
     body.extend_from_slice(&[0u8; 16]);           // client_guid
     body.extend_from_slice(&0u32.to_le_bytes());  // negotiate_context_offset
     body.extend_from_slice(&0u16.to_le_bytes());  // negotiate_context_count
     body.extend_from_slice(&0u16.to_le_bytes());  // reserved2
+    // Offer only dialects that use HMAC-SHA256 signing (2.0.2, 2.1).
+    // SMB 3.x requires AES-CMAC with a separate KDF; servers downgrade gracefully to 2.1.
     body.extend_from_slice(&0x0202u16.to_le_bytes()); // SMB 2.0.2
     body.extend_from_slice(&0x0210u16.to_le_bytes()); // SMB 2.1
-    body.extend_from_slice(&0x0300u16.to_le_bytes()); // SMB 3.0
     let mut pkt = hdr.to_vec();
     pkt.extend_from_slice(&body);
     pkt
@@ -163,7 +164,7 @@ pub fn session_setup_request(
     let mut body = Vec::new();
     body.extend_from_slice(&25u16.to_le_bytes()); // structure_size
     body.push(0u8);                               // flags
-    body.push(1u8);                               // security_mode (signing capable)
+    body.push(3u8);                               // security_mode: SIGNING_CAPABLE | SIGNING_REQUIRED
     body.extend_from_slice(&0x7fu32.to_le_bytes()); // capabilities
     body.extend_from_slice(&0u32.to_le_bytes());  // channel
     body.extend_from_slice(&sec_buf_offset.to_le_bytes());
@@ -427,6 +428,32 @@ pub fn parse_ioctl(buf: &[u8]) -> anyhow::Result<Vec<u8>> {
     } else {
         Ok(Vec::new())
     }
+}
+
+/// Sign an SMB2 message with HMAC-SHA256 (dialects 2.0.2 and 2.1).
+///
+/// Sets `SMB2_FLAGS_SIGNED` in the header flags, zeros the 16-byte signature
+/// field, computes HMAC-SHA256(key, message), and writes the first 16 bytes of
+/// the result back into the signature field (bytes 48–63).
+pub fn sign_smb2_message(payload: &[u8], key: &[u8; 16]) -> Vec<u8> {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    type HmacSha256 = Hmac<Sha256>;
+
+    let mut msg = payload.to_vec();
+    if msg.len() < 64 {
+        return msg;
+    }
+    // Set SMB2_FLAGS_SIGNED (0x00000008) in the header flags field (bytes 16–19).
+    let flags = u32::from_le_bytes([msg[16], msg[17], msg[18], msg[19]]) | 0x0000_0008;
+    msg[16..20].copy_from_slice(&flags.to_le_bytes());
+    // The signature field (bytes 48–63) must be zeroed before computing the HMAC.
+    msg[48..64].fill(0);
+    // HMAC-SHA256 over the complete message; truncate to 16 bytes.
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
+    mac.update(&msg);
+    msg[48..64].copy_from_slice(&mac.finalize().into_bytes()[..16]);
+    msg
 }
 
 /// Build an SMB2 TreeDisconnect request.

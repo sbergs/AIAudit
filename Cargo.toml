@@ -15,20 +15,22 @@ regex = "1"
 rayon = "1"
 colored = "2"
 base64 = "0.22"
+rand = "0.8"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"
 
 [features]
 default = []
-remote   = ["dep:ldap3"]
+remote   = ["dep:ldap3", "dep:hmac", "dep:sha2"]
 kerberos = ["remote", "dep:libgssapi"]
-# winrm_compat re-enables the legacy WinRM client; also requires enabling reqwest
-winrm_compat = ["dep:reqwest"]
 
-[dependencies.reqwest]
+[dependencies.hmac]
 version = "0.12"
-features = ["blocking", "json"]
+optional = true
+
+[dependencies.sha2]
+version = "0.10"
 optional = true
 
 [dependencies.ldap3]
