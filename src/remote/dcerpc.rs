@@ -52,7 +52,7 @@ impl DceRpc {
 fn rpc_header(pkt_type: u8, call_id: u32, frag_len: u16) -> [u8; 16] {
     let mut h = [0u8; 16];
     h[0] = 5; h[1] = 0; h[2] = pkt_type; h[3] = 0x03;
-    h[4..8].copy_from_slice(&0x1000_0000u32.to_le_bytes());
+    h[4..8].copy_from_slice(&0x0000_0010u32.to_le_bytes()); // NDR little-endian
     h[8..10].copy_from_slice(&frag_len.to_le_bytes());
     h[10..12].copy_from_slice(&0u16.to_le_bytes());
     h[12..16].copy_from_slice(&call_id.to_le_bytes());
@@ -93,12 +93,39 @@ fn parse_bind_ack(buf: &[u8]) -> anyhow::Result<()> {
     }
     match buf[2] {
         PKT_FAULT => {
-            let status = if buf.len() >= 24 {
-                u32::from_le_bytes([buf[20], buf[21], buf[22], buf[23]])
+            // Fault body: alloc_hint(4)+p_cont_id(2)+cancel(1)+reserved(1)+status(4) → status at 24
+            let status = if buf.len() >= 28 {
+                u32::from_le_bytes([buf[24], buf[25], buf[26], buf[27]])
             } else { 0 };
             anyhow::bail!("DCE/RPC BIND returned FAULT: 0x{:08X}", status);
         }
-        12 => Ok(()), // BIND_ACK
+        12 => {
+            // BIND_ACK body (after 16-byte header):
+            //   max_xmit(2) + max_recv(2) + assoc_group(4) + sec_addr_len(2) + sec_addr(var) + pad + results
+            if buf.len() < 26 {
+                return Ok(()); // too short to parse further, hope for the best
+            }
+            let sec_len = u16::from_le_bytes([buf[24], buf[25]]) as usize;
+            let after_sec = 26 + sec_len;
+            // Align to 4 bytes
+            let pad = (4 - (after_sec % 4)) % 4;
+            let results_offset = after_sec + pad;
+            if buf.len() >= results_offset + 4 {
+                // num_results (2) + first result (2)
+                let result = u16::from_le_bytes([
+                    buf[results_offset + 2], buf[results_offset + 3],
+                ]);
+                if result != 0 {
+                    let reason = if buf.len() >= results_offset + 6 {
+                        u16::from_le_bytes([buf[results_offset + 4], buf[results_offset + 5]])
+                    } else { 0 };
+                    anyhow::bail!(
+                        "DCE/RPC BIND_ACK: context rejected (result={}, reason={})", result, reason
+                    );
+                }
+            }
+            Ok(())
+        }
         other => anyhow::bail!("DCE/RPC expected BIND_ACK (12), got {}", other),
     }
 }
@@ -120,12 +147,17 @@ fn parse_response(buf: &[u8]) -> anyhow::Result<Vec<u8>> {
     if buf.len() < 16 { anyhow::bail!("DCE/RPC RESPONSE too short"); }
     match buf[2] {
         PKT_FAULT => {
-            let s = if buf.len() >= 24 {
-                u32::from_le_bytes([buf[20], buf[21], buf[22], buf[23]])
+            // Fault body layout (after 16-byte header):
+            //   alloc_hint(4) + p_cont_id(2) + cancel_count(1) + reserved(1) + status(4)
+            // → status is at offset 16+8 = 24
+            let s = if buf.len() >= 28 {
+                u32::from_le_bytes([buf[24], buf[25], buf[26], buf[27]])
             } else { 0 };
             anyhow::bail!("DCE/RPC REQUEST returned FAULT: 0x{:08X}", s);
         }
         PKT_RESPONSE => {
+            // Response body: alloc_hint(4) + p_context_id(2) + cancel_count(1) + reserved(1)
+            // → stub data starts at offset 16+8 = 24
             if buf.len() < 24 { return Ok(Vec::new()); }
             Ok(buf[24..].to_vec())
         }

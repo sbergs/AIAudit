@@ -36,7 +36,7 @@ pub struct Scm {
 impl Scm {
     /// Open a connection to the SCM on the remote host via \pipe\svcctl.
     pub fn open(session: &SmbSession, ipc_tree: TreeId) -> anyhow::Result<Self> {
-        let pipe_handle = session.open_named_pipe_on_tree(ipc_tree, r"\pipe\svcctl")?;
+        let pipe_handle = session.open_named_pipe_on_tree(ipc_tree, "svcctl")?;
 
         let scm_uuid = uuid_from_str(SCM_UUID_STR)?;
         let rpc = DceRpc::bind(session, ipc_tree, pipe_handle, &scm_uuid, 2, 0)?;
@@ -62,9 +62,16 @@ impl Scm {
         let create_resp = self.rpc.call(session, OPNUM_CREATE_SERVICE, &create_stub)?;
         let svc_handle = parse_create_service_resp(&create_resp)?;
 
-        // StartServiceW
+        // StartServiceW. 1053 = ERROR_SERVICE_REQUEST_TIMEOUT is expected when the
+        // binary doesn't call StartServiceCtrlDispatcher; any other non-zero code is
+        // a real failure (e.g., binary not found = 2, access denied = 5).
         let start_stub = start_service_stub(&svc_handle);
-        self.rpc.call(session, OPNUM_START_SERVICE, &start_stub)?;
+        let start_resp = self.rpc.call(session, OPNUM_START_SERVICE, &start_stub)?;
+        let start_rc = u32_from_tail(&start_resp);
+        if start_rc != 0 && start_rc != 1053 {
+            let _ = self.delete_service(session, &svc_handle);
+            anyhow::bail!("StartServiceW failed: Win32 error 0x{:08X}", start_rc);
+        }
 
         // Poll QueryServiceStatus until STOPPED (state == 1), timeout 5 minutes
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
@@ -98,72 +105,83 @@ impl Scm {
 
 // ─── NDR encoding helpers ────────────────────────────────────────────────────
 
+/// Read the last 4 bytes of a stub as a little-endian u32 (Win32 return code).
+fn u32_from_tail(buf: &[u8]) -> u32 {
+    if buf.len() < 4 { return 0; }
+    u32::from_le_bytes([buf[buf.len()-4], buf[buf.len()-3], buf[buf.len()-2], buf[buf.len()-1]])
+}
+
 fn ndr_u32(v: u32) -> [u8; 4] {
     v.to_le_bytes()
 }
 
-/// NDR conformant varying string (unique pointer variant).
-/// If None: 4-byte null referent.
-/// If Some(s): referent(4) + max_count(4) + offset(4) + actual_count(4) + utf16le + null + align.
-fn ndr_unique_wstring(s: Option<&str>) -> Vec<u8> {
-    match s {
-        None => vec![0u8; 4],
-        Some(text) => {
-            let mut utf16: Vec<u16> = text.encode_utf16().collect();
-            utf16.push(0); // null terminator
-            let char_count = utf16.len() as u32;
-            let byte_len = (char_count * 2) as usize;
-
-            let mut out = Vec::new();
-            // referent (non-null pointer)
-            out.extend_from_slice(&[0x00, 0x00, 0x00, 0x02]);
-            out.extend_from_slice(&ndr_u32(char_count)); // max_count
-            out.extend_from_slice(&ndr_u32(0));           // offset
-            out.extend_from_slice(&ndr_u32(char_count)); // actual_count
-            for c in &utf16 {
-                out.extend_from_slice(&c.to_le_bytes());
-            }
-            // pad to 4-byte alignment
-            let pad = (4 - (byte_len % 4)) % 4;
-            out.extend(std::iter::repeat(0u8).take(pad));
-            out
-        }
-    }
+/// Null unique pointer (4 zero bytes = NULL referent).
+fn ndr_null_ptr() -> [u8; 4] {
+    [0u8; 4]
 }
 
-/// Null unique pointer (4 zero bytes).
-fn ndr_unique_ptr_null() -> [u8; 4] {
-    [0u8; 4]
+/// NDR conformant varying string body — embedded inline in the NDR stream.
+/// Encodes: MaxCount(4) + Offset(4) + ActualCount(4) + UTF-16LE chars (with null) + alignment.
+fn ndr_wstring_body(text: &str) -> Vec<u8> {
+    let mut utf16: Vec<u16> = text.encode_utf16().collect();
+    utf16.push(0); // null terminator
+    let char_count = utf16.len() as u32;
+    let byte_len = (char_count * 2) as usize;
+    let mut out = Vec::new();
+    out.extend_from_slice(&char_count.to_le_bytes()); // MaxCount
+    out.extend_from_slice(&0u32.to_le_bytes());        // Offset
+    out.extend_from_slice(&char_count.to_le_bytes()); // ActualCount
+    for c in &utf16 {
+        out.extend_from_slice(&c.to_le_bytes());
+    }
+    // Pad body to 4-byte alignment
+    let pad = (4 - (byte_len % 4)) % 4;
+    out.extend(std::iter::repeat_n(0u8, pad));
+    out
 }
 
 // ─── Stub builders ───────────────────────────────────────────────────────────
 
 fn open_scm_stub() -> Vec<u8> {
-    // OpenSCManagerW(MachineName=NULL, DatabaseName="ServicesActive", SC_MANAGER_ALL_ACCESS)
+    // ROpenSCManagerW(MachineName=NULL, DatabaseName=NULL, SC_MANAGER_ALL_ACCESS)
+    // NULL DatabaseName → server defaults to ServicesActive.
     let mut s = Vec::new();
-    s.extend_from_slice(&ndr_unique_ptr_null()); // MachineName = NULL
-    s.extend_from_slice(&ndr_unique_wstring(Some("ServicesActive")));
-    s.extend_from_slice(&ndr_u32(0x000F_003F)); // SC_MANAGER_ALL_ACCESS
+    s.extend_from_slice(&ndr_null_ptr()); // lpMachineName = NULL
+    s.extend_from_slice(&ndr_null_ptr()); // lpDatabaseName = NULL
+    s.extend_from_slice(&ndr_u32(0x000F_003F)); // dwDesiredAccess = SC_MANAGER_ALL_ACCESS
     s
 }
 
 fn create_service_stub(sc_handle: &[u8; 20], svc_name: &str, bin_path: &str) -> Vec<u8> {
+    // RCreateServiceW NDR encoding per Samba/Wine IDL (wire-tested against Windows):
+    //
+    //   [in,string,charset(UTF16)] uint16 *ServiceName   → embedded conformant string
+    //   [in,unique,string,charset(UTF16)] uint16 *DisplayName → unique ptr (we pass NULL)
+    //   [in,string,charset(UTF16)] uint16 *binary_path   → embedded conformant string
+    //
+    // Layout:
+    //   hSCManager(20) + ServiceName_embedded(var) + DisplayName_ref(4=NULL) +
+    //   4×DWORD(16) + BinaryPath_embedded(var) + NullGroup_ref(4) +
+    //   TagId_ref(4) + Dependencies_ref(4) + DependSize(4) +
+    //   ServiceStartName_ref(4) + Password_ref(4) + PwSize(4)
+    // No deferred section (DisplayName is NULL so nothing to defer).
+
     let mut s = Vec::new();
-    s.extend_from_slice(sc_handle);
-    s.extend_from_slice(&ndr_unique_wstring(Some(svc_name))); // lpServiceName
-    s.extend_from_slice(&ndr_unique_wstring(Some(svc_name))); // lpDisplayName
-    s.extend_from_slice(&ndr_u32(0x000F_01FF)); // SERVICE_ALL_ACCESS
-    s.extend_from_slice(&ndr_u32(0x10));        // SERVICE_WIN32_OWN_PROCESS
-    s.extend_from_slice(&ndr_u32(3));           // SERVICE_DEMAND_START
-    s.extend_from_slice(&ndr_u32(0));           // SERVICE_ERROR_IGNORE
-    s.extend_from_slice(&ndr_unique_wstring(Some(bin_path))); // lpBinaryPathName
-    s.extend_from_slice(&ndr_unique_ptr_null()); // lpLoadOrderGroup
-    s.extend_from_slice(&ndr_unique_ptr_null()); // lpdwTagId
-    s.extend_from_slice(&ndr_unique_ptr_null()); // lpDependencies
-    s.extend_from_slice(&ndr_u32(0));            // dwDependSize
-    s.extend_from_slice(&ndr_unique_wstring(None)); // lpServiceStartName (NULL = LocalSystem)
-    s.extend_from_slice(&ndr_unique_ptr_null()); // lpPassword
-    s.extend_from_slice(&ndr_u32(0));            // dwPwSize
+    s.extend_from_slice(sc_handle);                          // hSCManager (20)
+    s.extend_from_slice(&ndr_wstring_body(svc_name));        // ServiceName embedded
+    s.extend_from_slice(&ndr_null_ptr());                    // DisplayName = NULL
+    s.extend_from_slice(&ndr_u32(0x000F_01FF));              // dwDesiredAccess
+    s.extend_from_slice(&ndr_u32(0x10));                     // SERVICE_WIN32_OWN_PROCESS
+    s.extend_from_slice(&ndr_u32(3));                        // SERVICE_DEMAND_START
+    s.extend_from_slice(&ndr_u32(0));                        // SERVICE_ERROR_IGNORE
+    s.extend_from_slice(&ndr_wstring_body(bin_path));        // BinaryPathName embedded
+    s.extend_from_slice(&ndr_null_ptr());                    // lpLoadOrderGroup = NULL
+    s.extend_from_slice(&ndr_null_ptr());                    // lpdwTagId = NULL
+    s.extend_from_slice(&ndr_null_ptr());                    // lpDependencies = NULL
+    s.extend_from_slice(&ndr_u32(0));                        // dwDependSize = 0
+    s.extend_from_slice(&ndr_null_ptr());                    // lpServiceStartName = NULL
+    s.extend_from_slice(&ndr_null_ptr());                    // lpPassword = NULL
+    s.extend_from_slice(&ndr_u32(0));                        // dwPwSize = 0
     s
 }
 

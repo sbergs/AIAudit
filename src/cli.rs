@@ -9,7 +9,7 @@ use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
-#[command(name = "aihound", about = "AI Credential & Secrets Scanner", version)]
+#[command(name = "aiaudit", about = "AI Credential & Secrets Scanner", version)]
 pub struct Cli {
     #[command(flatten)]
     pub scan: ScanArgs,

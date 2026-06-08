@@ -69,14 +69,31 @@ fn scan_one_host(host: &Host, config: &RemoteConfig) -> anyhow::Result<Vec<ScanR
 
     session.write_file(admin_tree, &exe_rel, &bytes)?;
 
-    // Run via SCM — output redirected to a temp file
-    let binary_path = format!(r"cmd /c {} --json > {} 2>&1", exe_abs, out_abs);
+    // Run via SCM. Use --json-file to write output directly to a file rather than
+    // stdout, avoiding the cmd.exe wrapper and shell redirection entirely. This also
+    // sidesteps stdout/stderr handling issues when running in Session 0 (service context).
+    let binary_path = format!(r"{} --json-file {}", exe_abs, out_abs);
 
     let mut scm = Scm::open(&session, ipc_tree)?;
     scm.run_command(&session, &svc_name, &binary_path)?;
 
-    // Read output
-    let output = session.read_file(admin_tree, &out_rel)?;
+    // Read output. The binary writes directly to out_abs via --json-file, so the
+    // file appears only when the scan finishes. Poll until data arrives or 3 minutes.
+    let output = {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+        let mut last = Vec::new();
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            match session.read_file(admin_tree, &out_rel) {
+                Ok(data) if !data.is_empty() => { last = data; break; }
+                _ => {}
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+        }
+        last
+    };
 
     // Best-effort cleanup
     let _ = session.delete_file(admin_tree, &exe_rel);

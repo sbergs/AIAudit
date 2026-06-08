@@ -103,21 +103,57 @@ pub fn recv_message(stream: &mut impl Read) -> anyhow::Result<Vec<u8>> {
 
 // ─── Request builders ────────────────────────────────────────────────────────
 
+/// Build an SMB1 multi-protocol negotiate request.
+///
+/// Windows SMB servers expect this legacy preamble before accepting a direct
+/// SMB2 connection. The client advertises a dialect list that includes
+/// "SMB 2.002" and "SMB 2.???" so the server knows to reply with SMB2. The
+/// server's response is a standard SMB2 Negotiate Response that our
+/// `parse_negotiate` parser handles normally.
+pub fn smb1_negotiate_request() -> Vec<u8> {
+    let dialects: &[&str] = &[
+        "PC NETWORK PROGRAM 1.0",
+        "LANMAN1.0",
+        "Windows for Workgroups 3.1a",
+        "LM1.2X002",
+        "LANMAN2.1",
+        "NT LM 0.12",
+        "SMB 2.002",
+        "SMB 2.???",
+    ];
+    let mut dialect_buf = Vec::new();
+    for d in dialects {
+        dialect_buf.push(0x02u8); // BufferFormat = Dialect
+        dialect_buf.extend_from_slice(d.as_bytes());
+        dialect_buf.push(0x00u8); // null terminator
+    }
+    // SMB1 header: protocol_id(4) + command(1) + status(4) + flags(1) +
+    //              flags2(2) + pidhigh(2) + security_features(8) +
+    //              reserved(2) + tid(2) + pid_low(2) + uid(2) + mid(2) = 32 bytes
+    let mut hdr = vec![0u8; 32];
+    hdr[0..4].copy_from_slice(&[0xFF, 0x53, 0x4D, 0x42]); // "\xFFSMB"
+    hdr[4] = 0x72; // SMB_COM_NEGOTIATE
+    // WordCount=0 and ByteCount+dialects follow the header
+    let mut pkt = hdr;
+    pkt.push(0x00); // WordCount = 0
+    pkt.extend_from_slice(&(dialect_buf.len() as u16).to_le_bytes()); // ByteCount
+    pkt.extend_from_slice(&dialect_buf);
+    pkt
+}
+
 /// Build an SMB2 Negotiate request.
 pub fn negotiate_request(message_id: u64) -> Vec<u8> {
     let hdr = smb2_header(CMD_NEGOTIATE, message_id, 0, 0, 0);
     let mut body = Vec::new();
     body.extend_from_slice(&36u16.to_le_bytes()); // structure_size
     body.extend_from_slice(&2u16.to_le_bytes());  // dialect_count
-    body.extend_from_slice(&3u16.to_le_bytes());  // security_mode: SIGNING_CAPABLE | SIGNING_REQUIRED
+    body.extend_from_slice(&1u16.to_le_bytes());  // security_mode: SIGNING_CAPABLE
     body.extend_from_slice(&0u16.to_le_bytes());  // reserved
     body.extend_from_slice(&0x7fu32.to_le_bytes()); // capabilities
     body.extend_from_slice(&[0u8; 16]);           // client_guid
     body.extend_from_slice(&0u32.to_le_bytes());  // negotiate_context_offset
     body.extend_from_slice(&0u16.to_le_bytes());  // negotiate_context_count
     body.extend_from_slice(&0u16.to_le_bytes());  // reserved2
-    // Offer only dialects that use HMAC-SHA256 signing (2.0.2, 2.1).
-    // SMB 3.x requires AES-CMAC with a separate KDF; servers downgrade gracefully to 2.1.
     body.extend_from_slice(&0x0202u16.to_le_bytes()); // SMB 2.0.2
     body.extend_from_slice(&0x0210u16.to_le_bytes()); // SMB 2.1
     let mut pkt = hdr.to_vec();
@@ -164,7 +200,7 @@ pub fn session_setup_request(
     let mut body = Vec::new();
     body.extend_from_slice(&25u16.to_le_bytes()); // structure_size
     body.push(0u8);                               // flags
-    body.push(3u8);                               // security_mode: SIGNING_CAPABLE | SIGNING_REQUIRED
+    body.push(1u8);                               // security_mode: SIGNING_CAPABLE
     body.extend_from_slice(&0x7fu32.to_le_bytes()); // capabilities
     body.extend_from_slice(&0u32.to_le_bytes());  // channel
     body.extend_from_slice(&sec_buf_offset.to_le_bytes());
@@ -265,12 +301,17 @@ pub fn parse_create(buf: &[u8]) -> anyhow::Result<[u8; 16]> {
     if status != STATUS_OK {
         anyhow::bail!("SMB2 Create failed: status 0x{:08X}", status);
     }
-    // structure_size(2)+oplock(1)+flags(1) = 4 bytes, then FileId at offset 64+4 = 68
-    if buf.len() < 68 + 16 {
+    // Create response body layout (offsets relative to body start at buf[64]):
+    //   StructureSize(2)+OplockLevel(1)+Flags(1)+CreateAction(4)+
+    //   CreationTime(8)+LastAccessTime(8)+LastWriteTime(8)+ChangeTime(8)+
+    //   AllocationSize(8)+EndofFile(8)+FileAttributes(4)+Reserved2(4) = 64 bytes
+    //   FileId volatile(8)+FileId persistent(8) = 16 bytes starting at body offset 64
+    // → FileId is at message offset 64+64 = 128
+    if buf.len() < 128 + 16 {
         anyhow::bail!("SMB2 Create response too short for FileId");
     }
     let mut fid = [0u8; 16];
-    fid.copy_from_slice(&buf[68..84]);
+    fid.copy_from_slice(&buf[128..144]);
     Ok(fid)
 }
 

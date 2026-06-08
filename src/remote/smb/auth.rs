@@ -171,6 +171,24 @@ pub fn hmac_md5(key: &[u8], data: &[u8]) -> [u8; 16] {
     md5(&outer)
 }
 
+// ─── RC4 (used for KEY_EXCH session-key encryption) ─────────────────────────
+
+pub fn rc4(key: &[u8], data: &[u8]) -> Vec<u8> {
+    let mut s: Vec<u8> = (0u8..=255).collect();
+    let mut j = 0usize;
+    for i in 0..256 {
+        j = (j + s[i] as usize + key[i % key.len()] as usize) % 256;
+        s.swap(i, j);
+    }
+    let (mut i, mut j) = (0usize, 0usize);
+    data.iter().map(|&b| {
+        i = (i + 1) % 256;
+        j = (j + s[i] as usize) % 256;
+        s.swap(i, j);
+        b ^ s[(s[i] as usize + s[j] as usize) % 256]
+    }).collect()
+}
+
 // ─── NT hash ─────────────────────────────────────────────────────────────────
 
 pub fn nt_hash(password: &str) -> [u8; 16] {
@@ -195,8 +213,14 @@ pub fn filetime_now() -> u64 {
 
 pub fn build_type1() -> Vec<u8> {
     const SIG: &[u8; 8] = b"NTLMSSP\0";
-    const FLAGS: u32 = 0x0000_0001 | 0x0000_0002 | 0x0000_0004
-                     | 0x0000_0200 | 0x0000_8000 | 0x0008_0000;
+    const FLAGS: u32 = 0x0000_0001 // NEGOTIATE_UNICODE
+                     | 0x0000_0002 // NEGOTIATE_OEM
+                     | 0x0000_0004 // REQUEST_TARGET
+                     | 0x0000_0200 // NEGOTIATE_NTLM
+                     | 0x0000_8000 // NEGOTIATE_ALWAYS_SIGN
+                     | 0x0008_0000 // NEGOTIATE_EXTENDED_SESSIONSECURITY
+                     | 0x2000_0000 // NEGOTIATE_128
+                     | 0x8000_0000; // NEGOTIATE_56
     let mut msg = Vec::with_capacity(32);
     msg.extend_from_slice(SIG);
     msg.extend_from_slice(&1u32.to_le_bytes());
@@ -206,7 +230,8 @@ pub fn build_type1() -> Vec<u8> {
     msg
 }
 
-pub fn parse_type2(msg: &[u8]) -> anyhow::Result<([u8; 8], Vec<u8>)> {
+/// Returns (server_challenge, target_info, negotiate_flags).
+pub fn parse_type2(msg: &[u8]) -> anyhow::Result<([u8; 8], Vec<u8>, u32)> {
     if msg.len() < 56 {
         anyhow::bail!("NTLM Type2 message too short ({})", msg.len());
     }
@@ -218,6 +243,8 @@ pub fn parse_type2(msg: &[u8]) -> anyhow::Result<([u8; 8], Vec<u8>)> {
     }
     let mut challenge = [0u8; 8];
     challenge.copy_from_slice(&msg[24..32]);
+
+    let flags = u32::from_le_bytes([msg[20], msg[21], msg[22], msg[23]]);
 
     let target_info = if msg.len() >= 48 {
         let ti_len = u16::from_le_bytes([msg[40], msg[41]]) as usize;
@@ -231,7 +258,7 @@ pub fn parse_type2(msg: &[u8]) -> anyhow::Result<([u8; 8], Vec<u8>)> {
         Vec::new()
     };
 
-    Ok((challenge, target_info))
+    Ok((challenge, target_info, flags))
 }
 
 pub fn build_type3(
@@ -240,9 +267,16 @@ pub fn build_type3(
     user: &str,
     domain: &str,
     password: &str,
+    server_flags: u32,
 ) -> (Vec<u8>, [u8; 16]) {
     const SIG: &[u8; 8] = b"NTLMSSP\0";
-    const FLAGS: u32 = 0xa082_8a05;
+    const NTLMSSP_NEGOTIATE_KEY_EXCH: u32 = 0x4000_0000;
+    let key_exch = (server_flags & NTLMSSP_NEGOTIATE_KEY_EXCH) != 0;
+
+    // Echo back flags the server granted, forcing UNICODE and key-exch state to match.
+    let flags = server_flags
+        & !(0x0000_0002) // clear OEM: we use UNICODE
+        | 0x0000_0001;  // ensure UNICODE is set
 
     let nt = nt_hash(password);
     let mut identity = user.to_uppercase();
@@ -254,7 +288,8 @@ pub fn build_type3(
     let ts = filetime_now();
 
     let mut blob = Vec::new();
-    blob.extend_from_slice(&0x0101_0000u32.to_le_bytes());
+    // NTLMv2ClientChallenge header: RespType=1, HiRespType=1, Reserved1=0, Reserved2=0
+    blob.extend_from_slice(&0x0000_0101u32.to_le_bytes());
     blob.extend_from_slice(&0u32.to_le_bytes());
     blob.extend_from_slice(&ts.to_le_bytes());
     blob.extend_from_slice(&cc);
@@ -296,16 +331,35 @@ pub fn build_type3(
     push_sec_buf(&mut msg, nt_resp.len() as u16,      nt_off);
     push_sec_buf(&mut msg, domain_utf16.len() as u16, domain_off);
     push_sec_buf(&mut msg, user_utf16.len() as u16,   user_off);
-    push_sec_buf(&mut msg, 0, ws_off); // workstation
-    push_sec_buf(&mut msg, 0, ws_off); // session key
-    msg.extend_from_slice(&FLAGS.to_le_bytes());
-    msg.extend_from_slice(&[0u8; 8]); // version
+    // KEY_EXCH: generate a random ExportedSessionKey, RC4-encrypt it under the
+    // SessionBaseKey, and include the encrypted form in the Type3 session key field.
+    // Without KEY_EXCH the ExportedSessionKey == SessionBaseKey directly.
+    let (exported_session_key, encrypted_session_key): ([u8; 16], Vec<u8>) = if key_exch {
+        use rand::{RngCore, rngs::OsRng};
+        let mut esk = [0u8; 16];
+        OsRng.fill_bytes(&mut esk);
+        let encrypted = rc4(&session_base_key, &esk);
+        (esk, encrypted)
+    } else {
+        (session_base_key, Vec::new())
+    };
+
+    let sk_off = ws_off; // session key data starts after the workstation (which is empty)
+    let sk_len = encrypted_session_key.len() as u16;
+
+    push_sec_buf(&mut msg, 0, ws_off); // workstation (empty)
+    push_sec_buf(&mut msg, sk_len, sk_off); // session key
+    msg.extend_from_slice(&flags.to_le_bytes());
+    msg.extend_from_slice(&[0u8; 8]); // version (zeroed; NTLMSSP_NEGOTIATE_VERSION not set)
 
     msg.extend_from_slice(&lm_resp);
     msg.extend_from_slice(&nt_resp);
     msg.extend_from_slice(&domain_utf16);
     msg.extend_from_slice(&user_utf16);
-    (msg, session_base_key)
+    if !encrypted_session_key.is_empty() {
+        msg.extend_from_slice(&encrypted_session_key);
+    }
+    (msg, exported_session_key)
 }
 
 fn push_sec_buf(buf: &mut Vec<u8>, len: u16, offset: u32) {
@@ -336,29 +390,27 @@ fn ber_tlv(tag: u8, content: &[u8]) -> Vec<u8> {
 }
 
 pub fn spnego_wrap_type1(ntlm: &[u8]) -> Vec<u8> {
+    // RFC 4178 §4.2.1: NegotiationToken CHOICE [0] NegTokenInit
+    // Structure: [60] { SPNEGO_OID [a0] { [30] { [a0] mechTypes [a2] mechToken } } }
     let mech_types_seq = ber_tlv(0x30, NTLM_OID);
-    let a0 = ber_tlv(0xa0, &mech_types_seq);
-    let mech_token = ber_tlv(0x04, ntlm);
-    let a2 = ber_tlv(0xa2, &mech_token);
-    let mut neg_init = Vec::new();
-    neg_init.extend_from_slice(&a0);
-    neg_init.extend_from_slice(&a2);
-    let neg_init_seq = ber_tlv(0x30, &neg_init);
+    let mech_types = ber_tlv(0xa0, &mech_types_seq);  // [0] mechTypes
+    let mech_token = ber_tlv(0xa2, &ber_tlv(0x04, ntlm)); // [2] mechToken
+    let mut neg_init_body = Vec::new();
+    neg_init_body.extend_from_slice(&mech_types);
+    neg_init_body.extend_from_slice(&mech_token);
+    let neg_token_init = ber_tlv(0xa0, &ber_tlv(0x30, &neg_init_body)); // [0] { SEQUENCE }
     let spnego_oid: &[u8] = &[0x06,0x06,0x2b,0x06,0x01,0x05,0x05,0x02];
     let mut app = Vec::new();
     app.extend_from_slice(spnego_oid);
-    app.extend_from_slice(&neg_init_seq);
+    app.extend_from_slice(&neg_token_init);
     ber_tlv(0x60, &app)
 }
 
 pub fn spnego_wrap_type3(ntlm: &[u8]) -> Vec<u8> {
-    let state = ber_tlv(0xa0, &[0x0a, 0x01, 0x01]);
-    let resp_oct = ber_tlv(0x04, ntlm);
-    let a2 = ber_tlv(0xa2, &resp_oct);
-    let mut content = Vec::new();
-    content.extend_from_slice(&state);
-    content.extend_from_slice(&a2);
-    let seq = ber_tlv(0x30, &content);
+    // RFC 4178 negTokenResp: [1] { [30] { [a2] responseToken } }
+    // Clients omit negState from their Authenticate response.
+    let resp_token = ber_tlv(0xa2, &ber_tlv(0x04, ntlm));
+    let seq = ber_tlv(0x30, &resp_token);
     ber_tlv(0xa1, &seq)
 }
 

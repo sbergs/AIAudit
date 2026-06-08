@@ -7,6 +7,7 @@ pub mod proto;
 
 use proto::*;
 
+use anyhow::Context as _;
 use std::net::TcpStream;
 use std::sync::Mutex;
 
@@ -56,7 +57,7 @@ impl SmbSession {
         let addr = format!("{}:445", host);
         let stream = TcpStream::connect(&addr)
             .map_err(|e| anyhow::anyhow!("TCP connect to {} failed: {}", addr, e))?;
-        stream.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(120)))?;
         stream.set_write_timeout(Some(std::time::Duration::from_secs(30)))?;
 
         let mut session = SmbSession {
@@ -155,14 +156,28 @@ impl SmbSession {
     }
 
     fn do_negotiate(&self) -> anyhow::Result<()> {
-        let mid = self.next_msg_id();
-        let pkt = negotiate_request(mid);
-        self.send(&pkt)?;
-        let resp = self.recv()?;
-        let (dialect, _blob) = parse_negotiate(&resp)?;
-        // Accept SMB 2.0.2 or 2.1 (the only dialects we offer; both use HMAC-SHA256 signing).
-        if !matches!(dialect, 0x0202 | 0x0210) {
-            anyhow::bail!("SMB2 Negotiate: unsupported dialect 0x{:04X}", dialect);
+        // Phase 1: SMB1 multi-protocol negotiate.
+        // Windows servers require this preamble. We include "SMB 2.002" and
+        // "SMB 2.???" so the server replies with an SMB2 Negotiate Response.
+        let legacy = smb1_negotiate_request();
+        self.send(&legacy).context("negotiate (smb1 preamble) send")?;
+        let resp1 = self.recv().context("negotiate (smb1 preamble) recv")?;
+        let (dialect1, _) = parse_negotiate(&resp1)?;
+
+        // Phase 2: if the server returned 0x02FF ("SMB 2.???") it wants a full
+        // SMB2 Negotiate before we continue. Per MS-SMB2 §3.2.4.2.1:
+        // "If DialectRevision is 0x02FF, send an SMB2 NEGOTIATE request."
+        if dialect1 == 0x02FF {
+            let mid = self.next_msg_id();
+            let pkt2 = negotiate_request(mid);
+            self.send(&pkt2).context("negotiate (smb2) send")?;
+            let resp2 = self.recv().context("negotiate (smb2) recv")?;
+            let (dialect2, _) = parse_negotiate(&resp2)?;
+            if !matches!(dialect2, 0x0202 | 0x0210) {
+                anyhow::bail!("SMB2 Negotiate: unsupported dialect 0x{:04X}", dialect2);
+            }
+        } else if !matches!(dialect1, 0x0202 | 0x0210) {
+            anyhow::bail!("SMB2 Negotiate: unsupported dialect 0x{:04X}", dialect1);
         }
         Ok(())
     }
@@ -173,8 +188,8 @@ impl SmbSession {
         let spnego1 = auth::spnego_wrap_type1(&type1);
         let mid1 = self.next_msg_id();
         let pkt1 = session_setup_request(mid1, 0, &spnego1);
-        self.send(&pkt1)?;
-        let resp1 = self.recv()?;
+        self.send(&pkt1).context("session_setup round1 send")?;
+        let resp1 = self.recv().context("session_setup round1 recv")?;
         let (status1, session_id1, blob1) = parse_session_setup(&resp1)?;
         if status1 != STATUS_MORE_PROCESSING {
             anyhow::bail!(
@@ -186,25 +201,28 @@ impl SmbSession {
         // Extract Type2 challenge
         let ntlm2 = auth::spnego_extract_ntlm(&blob1)
             .ok_or_else(|| anyhow::anyhow!("NTLM challenge not found in Type2 message"))?;
-        let (server_challenge, target_info) = auth::parse_type2(&ntlm2)?;
+        let (server_challenge, target_info, server_flags) = auth::parse_type2(&ntlm2)?;
 
-        // Round 2: send Type3
-        let (type3, session_key) =
-            auth::build_type3(&server_challenge, &target_info, user, domain, password);
+        // Round 2: send Type3. build_type3 handles KEY_EXCH: if the server set it,
+        // a random ExportedSessionKey is RC4-encrypted under the SessionBaseKey and
+        // included in the Type3 session key field. The returned exported_session_key
+        // is what both sides use as the SMB2 SigningKey (for dialects 2.x).
+        let (type3, exported_session_key) =
+            auth::build_type3(&server_challenge, &target_info, user, domain, password, server_flags);
         let spnego3 = auth::spnego_wrap_type3(&type3);
         let mid2 = self.next_msg_id();
         let pkt2 = session_setup_request(mid2, session_id1, &spnego3);
-        self.send(&pkt2)?;
-        let resp2 = self.recv()?;
+        self.send(&pkt2).context("session_setup round2 send")?;
+        let resp2 = self.recv().context("session_setup round2 recv")?;
         let (status2, session_id2, _) = parse_session_setup(&resp2)?;
         if status2 != STATUS_OK {
             anyhow::bail!("SMB2 SessionSetup authentication failed: status 0x{:08X}", status2);
         }
 
         self.session_id = session_id2;
-        // Activate signing: all subsequent messages (TreeConnect, Create, …) will be
-        // signed with HMAC-SHA256 using the NTLM exported session key.
-        self.signing_key = Some(session_key);
+        // Activate SMB2 signing. For dialects 2.x, SigningKey = ExportedSessionKey.
+        // The server will require signed messages for administrative shares (ADMIN$, IPC$).
+        self.signing_key = Some(exported_session_key);
         Ok(())
     }
 
@@ -222,8 +240,8 @@ impl SmbSession {
         let unc = format!("\\\\{}\\{}", peer, share);
         let mid = self.next_msg_id();
         let pkt = tree_connect_request(mid, self.session_id, &unc);
-        self.send(&pkt)?;
-        let resp = self.recv()?;
+        self.send(&pkt).with_context(|| format!("tree_connect {} send", share))?;
+        let resp = self.recv().with_context(|| format!("tree_connect {} recv", share))?;
         let tree_id = parse_tree_connect(&resp)?;
         Ok(TreeId(tree_id))
     }
@@ -236,12 +254,14 @@ impl SmbSession {
         for chunk in data.chunks(chunk_size) {
             let mid = self.next_msg_id();
             let pkt = write_request(mid, self.session_id, tree.0, &fid.0, offset, chunk);
-            self.send(&pkt)?;
-            let resp = self.recv()?;
+            self.send(&pkt).with_context(|| format!("write_file {} send @{}", path, offset))?;
+            let resp = self.recv().with_context(|| format!("write_file {} recv @{}", path, offset))?;
             let written = parse_write(&resp)?;
             offset += written as u64;
         }
-        self.close_handle(fid)
+        // Must close with the same TreeId used to open; Windows rejects CLOSE with
+        // a mismatched tree and leaves the handle open, which blocks execution.
+        self.close_handle_on_tree(tree, fid)
     }
 
     /// Read a file from `path` under the given tree, returning all bytes.
@@ -252,8 +272,8 @@ impl SmbSession {
         loop {
             let mid = self.next_msg_id();
             let pkt = read_request(mid, self.session_id, tree.0, &fid.0, offset, 65536);
-            self.send(&pkt)?;
-            let resp = self.recv()?;
+            self.send(&pkt).with_context(|| format!("read_file {} send @{}", path, offset))?;
+            let resp = self.recv().with_context(|| format!("read_file {} recv @{}", path, offset))?;
             let (status, chunk) = parse_read(&resp)?;
             if status == STATUS_END_OF_FILE || chunk.is_empty() {
                 break;
@@ -261,7 +281,7 @@ impl SmbSession {
             offset += chunk.len() as u64;
             data.extend_from_slice(&chunk);
         }
-        let _ = self.close_handle(fid);
+        let _ = self.close_handle_on_tree(tree, fid);
         Ok(data)
     }
 
@@ -328,11 +348,11 @@ impl SmbSession {
             0x0012_019f, // read | write
             0x3,         // share read|write
             1,           // FILE_OPEN
-            0x0,
+            0x40,        // FILE_NON_DIRECTORY_FILE
         );
-        self.send(&pkt)?;
-        let resp = self.recv()?;
-        let fid = parse_create(&resp)?;
+        self.send(&pkt).with_context(|| format!("open_pipe {} send", name))?;
+        let resp = self.recv().with_context(|| format!("open_pipe {} recv", name))?;
+        let fid = parse_create(&resp).with_context(|| format!("open_pipe {}", name))?;
         Ok(FileHandle(fid))
     }
 
@@ -361,8 +381,21 @@ impl SmbSession {
             data,
         );
         self.send(&pkt)?;
-        let resp = self.recv()?;
-        parse_ioctl(&resp)
+        // Loop to handle async STATUS_PENDING interim responses (0x00000103).
+        // Windows may send an interim response before the pipe returns data.
+        loop {
+            let resp = self.recv()?;
+            let status = if resp.len() >= 12 {
+                u32::from_le_bytes([resp[8], resp[9], resp[10], resp[11]])
+            } else {
+                0
+            };
+            if status == 0x0000_0103 {
+                // STATUS_PENDING — interim response; final response follows
+                continue;
+            }
+            return parse_ioctl(&resp);
+        }
     }
 
     /// Close a file/pipe handle.
@@ -390,13 +423,13 @@ impl SmbSession {
             tree.0,
             path,
             0x0012_01bf, // FILE_GENERIC_WRITE
-            0x0,         // exclusive
+            0x1,         // FILE_SHARE_READ — let AV scan while we upload
             5,           // FILE_OVERWRITE_IF
             0x0,
         );
-        self.send(&pkt)?;
-        let resp = self.recv()?;
-        let fid = parse_create(&resp)?;
+        self.send(&pkt).with_context(|| format!("open_write {} send", path))?;
+        let resp = self.recv().with_context(|| format!("open_write {} recv", path))?;
+        let fid = parse_create(&resp).with_context(|| format!("open_write {}", path))?;
         Ok(FileHandle(fid))
     }
 
@@ -412,9 +445,9 @@ impl SmbSession {
             1,           // FILE_OPEN
             0x0,
         );
-        self.send(&pkt)?;
-        let resp = self.recv()?;
-        let fid = parse_create(&resp)?;
+        self.send(&pkt).with_context(|| format!("open_read {} send", path))?;
+        let resp = self.recv().with_context(|| format!("open_read {} recv", path))?;
+        let fid = parse_create(&resp).with_context(|| format!("open_read {}", path))?;
         Ok(FileHandle(fid))
     }
 }
