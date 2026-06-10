@@ -44,6 +44,7 @@ pub enum SmbAuth {
 /// A live SMB2 session over a TCP/445 connection.
 pub struct SmbSession {
     stream: Mutex<TcpStream>,
+    hostname: String,
     session_id: u64,
     msg_counter: Mutex<u64>,
     /// HMAC-SHA256 signing key established after NTLM authentication. None during
@@ -62,6 +63,7 @@ impl SmbSession {
 
         let mut session = SmbSession {
             stream: Mutex::new(stream),
+            hostname: host.to_string(),
             session_id: 0,
             msg_counter: Mutex::new(1),
             signing_key: None,
@@ -162,7 +164,7 @@ impl SmbSession {
         let legacy = smb1_negotiate_request();
         self.send(&legacy).context("negotiate (smb1 preamble) send")?;
         let resp1 = self.recv().context("negotiate (smb1 preamble) recv")?;
-        let (dialect1, _) = parse_negotiate(&resp1)?;
+        let (dialect1, _) = parse_preamble_response(&resp1)?;
 
         // Phase 2: if the server returned 0x02FF ("SMB 2.???") it wants a full
         // SMB2 Negotiate before we continue. Per MS-SMB2 §3.2.4.2.1:
@@ -228,16 +230,7 @@ impl SmbSession {
 
     /// Connect to a share (e.g. "ADMIN$" or "IPC$") and return a TreeId.
     pub fn connect_tree(&self, share: &str) -> anyhow::Result<TreeId> {
-        // We need the server hostname for the UNC path. We'll derive it from the
-        // peer address of the TCP socket.
-        let peer = self
-            .stream
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .peer_addr()
-            .map(|a| a.ip().to_string())
-            .unwrap_or_else(|_| "server".to_string());
-        let unc = format!("\\\\{}\\{}", peer, share);
+        let unc = format!("\\\\{}\\{}", self.hostname, share);
         let mid = self.next_msg_id();
         let pkt = tree_connect_request(mid, self.session_id, &unc);
         self.send(&pkt).with_context(|| format!("tree_connect {} send", share))?;
@@ -303,34 +296,9 @@ impl SmbSession {
         let resp = self.recv()?;
         // Ignore status — best effort
         if let Ok(fid_bytes) = parse_create(&resp) {
-            let _ = self.close_handle(FileHandle(fid_bytes));
+            let _ = self.close_handle_on_tree(tree, FileHandle(fid_bytes));
         }
         Ok(())
-    }
-
-    /// Open a named pipe (on IPC$ tree). Path like `\pipe\svcctl`.
-    #[allow(dead_code)]
-    pub fn open_named_pipe(&self, name: &str) -> anyhow::Result<FileHandle> {
-        // IPC$ pipes: desired_access = generic RW, share_all, OPEN, no options
-        let mid = self.next_msg_id();
-        let pkt = create_request(
-            mid,
-            self.session_id,
-            // Named pipes must be on IPC$ — the caller must pass the right TreeId.
-            // Since we don't have access to the ipc tree_id here, the public API
-            // uses open_named_pipe_on_tree instead. This internal helper uses 0
-            // (which won't work). We expose the tree-id variant publicly.
-            0,
-            name,
-            0x0012_019f, // generic read|write
-            0x3,         // share read|write
-            1,           // FILE_OPEN
-            0x0,
-        );
-        self.send(&pkt)?;
-        let resp = self.recv()?;
-        let fid = parse_create(&resp)?;
-        Ok(FileHandle(fid))
     }
 
     /// Open a named pipe on the specified tree (use IPC$ tree for pipes).
@@ -354,15 +322,6 @@ impl SmbSession {
         let resp = self.recv().with_context(|| format!("open_pipe {} recv", name))?;
         let fid = parse_create(&resp).with_context(|| format!("open_pipe {}", name))?;
         Ok(FileHandle(fid))
-    }
-
-    /// Send data to a named pipe and receive response via FSCTL_PIPE_TRANSCEIVE.
-    #[allow(dead_code)]
-    pub fn transact_pipe(&self, handle: FileHandle, data: &[u8]) -> anyhow::Result<Vec<u8>> {
-        // Determine tree_id from context — we'll pass 0 for IPC$ which should
-        // have been connected. The tree_id is embedded in the handle's context,
-        // but SMB2 requires it in the header. We'll use a dedicated variant.
-        self.transact_pipe_on_tree(TreeId(0), handle, data)
     }
 
     /// Transact named pipe on a specific tree.
@@ -396,11 +355,6 @@ impl SmbSession {
             }
             return parse_ioctl(&resp);
         }
-    }
-
-    /// Close a file/pipe handle.
-    pub fn close_handle(&self, handle: FileHandle) -> anyhow::Result<()> {
-        self.close_handle_on_tree(TreeId(0), handle)
     }
 
     /// Close a handle with explicit tree_id.

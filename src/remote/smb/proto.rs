@@ -161,6 +161,20 @@ pub fn negotiate_request(message_id: u64) -> Vec<u8> {
     pkt
 }
 
+/// Parse the response to the SMB1 negotiate preamble.
+///
+/// Windows 2008+ responds with an SMB2 packet directly (delegates to
+/// `parse_negotiate`). Older or non-Windows servers may respond with an SMB1
+/// packet (`\xFF\x53\x4D\x42`); treat that as a "proceed to full SMB2
+/// negotiate" signal by returning dialect `0x02FF`.
+pub fn parse_preamble_response(buf: &[u8]) -> anyhow::Result<(u16, Vec<u8>)> {
+    if buf.len() >= 4 && buf[0..4] == [0xFF, 0x53, 0x4D, 0x42] {
+        Ok((0x02FF, Vec::new()))
+    } else {
+        parse_negotiate(buf)
+    }
+}
+
 /// Parse an SMB2 Negotiate response; returns (dialect, security_blob).
 pub fn parse_negotiate(buf: &[u8]) -> anyhow::Result<(u16, Vec<u8>)> {
     let (status, _, _) = parse_header(buf)?;
